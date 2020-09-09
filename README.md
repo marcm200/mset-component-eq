@@ -70,7 +70,7 @@ A textual output as above in the log file.
 
 All coefficients Ai are also stored in indiviudal text files of the name form `__md2_p3_A5.coeff.txt` 
 
-Intermediate and final matrices of the Bareiss algorithm are stored as `__md2_p4_k23.matrix`
+Intermediate and final matrices of the Bareiss algorithm are stored as `__md2_p4_k23.matrix` The computation be terminated by simply closing the command window. The last saved matrix should then be deleted as it does not contain valid data.
 
 
 ### Implementation
@@ -91,6 +91,7 @@ Big integers are stored to base 10^9.
 zero will occur at some point and terminates the program with a message.
 - the resultant is determined in its expanded form, but often takes Res=G^q for some small q. This factorization is currently not implemented.
 - all polynomial multiplications are performed anew as needed. Upcoming optimization will store intermediate results to reuse those, especially in the a(k)(k,k) multiplications.
+- the current computing matrix is stored directly onto hard disc. If the calculation is prematurely ended by closing the command window, computation can be resumed later on after deleting the last matrix file with the highest kNNN numbe as this file dos not yet contain fully valid data.
 
 
 ### Further information
