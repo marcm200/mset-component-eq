@@ -13,9 +13,11 @@
 	if using this in parallel applications, care must
 	be taken if passing the same physical object in different
 	parallel threads
+	
+	Marc Meidlinger
+	August-September 2020
 
 */
-
 
 // consts
 
