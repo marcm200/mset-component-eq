@@ -68,9 +68,9 @@ If defined, after division of big integers or polynomials some verifications are
 
 A textual output as above in the log file. 
 
-All coefficients Ai are also stored in indiviudal text files of the name form `__md2_p3_A5.coeff.txt` 
+All coefficients Ai are also stored in individual text files of the name form `__md2_p3_A5.coeff.txt` 
 
-Intermediate and final matrices of the Bareiss algorithm are stored as `__md2_p4_k23.matrix` The computation be terminated by simply closing the command window. The last saved matrix should then be deleted as it does not contain valid data.
+Intermediate and final matrices of the Bareiss algorithm are stored in files named `__md2_p4_k23.matrix` The computation can be terminated by simply closing the command window. The last saved matrix should then be deleted as it does not contain valid data.
 
 
 ### Implementation
