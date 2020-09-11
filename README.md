@@ -20,6 +20,10 @@ EH Bareiss, 1968"
 Although I tried my best to ensure correctness of the implementation and therefore the results,
 the code comes with no warranty.
 
+### Update history
+
+2020-09-11 added checks for very small chunk sizes and array settings that can lead to memory failure
+
 
 ### Overview
 
