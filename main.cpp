@@ -19,6 +19,8 @@
 	Marc Meidlinger
 	August-September 2020
 	
+	2020-09-11: added checks for very small chunk sizes
+	
 */
 
 #include "stdio.h"
@@ -803,6 +805,11 @@ ZMCterm* ZMCtermMemoryManager::getMemory(const int32_t aanz) {
 	ZMCterm *p=&current[freeFromIdx];
 	freeFromIdx = sum_int32t(freeFromIdx,aanz);
 	
+	if (freeFromIdx >= (allocatePerBlockIdx-8)) {
+		LOGMSG("\nError. ZMCtermMemorymanager. Requested size larger than page.\n");
+		exit(99);
+	}
+
 	return p;
 }
 
@@ -855,6 +862,11 @@ PZMCterm* PZMCtermMemoryManager::getMemory(const int32_t aanz) {
 	PZMCterm *p=&current[freeFromIdx];
 	freeFromIdx = sum_int32t(freeFromIdx,aanz);
 	
+	if (freeFromIdx >= (allocatePerBlockIdx-8)) {
+		LOGMSG("\nError. PZMCtermMemorymanager. Requested size larger than page.\n");
+		exit(99);
+	}
+
 	return p;
 }
 
