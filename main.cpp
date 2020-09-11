@@ -292,7 +292,7 @@ inline int32_t sum_int32t(
 		(sum < (-INT32MAX)) ||
 		(sum >   INT32MAX)
 	) {
-		LOGMSG("\nError. Overflow by int32 additionﬂn");
+		LOGMSG("\nError. Overflow by int32 addition√ün");
 		exit(99);
 	}
 	
@@ -632,8 +632,8 @@ void ZMCpolynom::addTerm_FZMC(
 			exit(99);
 		}
 
-		// copy used terms
-		for(int32_t i=0;i<anzterms;i++) {
+		// copy used terms, oldalloc instead of anzterms to copy NIL pointers
+		for(int32_t i=0;i<oldalloc;i++) {
 			terms[i]=old[i];
 		}
 		
@@ -706,6 +706,11 @@ void ZMCpolynom::initMemory(void) {
 		LOGMSG("\nError. Memory. ZMCpolynom::initMemory\n");
 		exit(99);
 	}
+
+	for(int32_t i=0;i<ALLOCATEINITIALLY;i++) {
+		terms[i]=NULL;
+	}
+
 	allocatedterms=ALLOCATEINITIALLY;
 }
 
@@ -1235,7 +1240,7 @@ void MatrixPolynom::load(
 	}
 	
 	if ( (!tmgr) || (!ptmgr) ) {
-		LOGMSG("\nError. Implementation. MatrixPolynom::load.memory managaer pointer is nil.ﬂn");
+		LOGMSG("\nError. Implementation. MatrixPolynom::load.memory managaer pointer is nil.√ün");
 		exit(99);
 	}
 	
@@ -2136,7 +2141,7 @@ void polynomPow_TNA(
 	powered.addTerm_FZMC(1,0,0,0); // positive 1
 	
 	for(int32_t i=1;i<=topower;i++) {
-		// holds: at end of every loop i: powered=(basef)^Ó
+		// holds: at end of every loop i: powered=(basef)^√Æ
 		
 		polynomMul_TAB(tmp,powered,basef);
 		powered.copyFrom(tmp);
