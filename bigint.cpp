@@ -72,21 +72,16 @@ struct BigInt {
 
 // forward
 
-void bigintDiv_TRAB(BigInt&,BigInt&,BigInt&,BigInt&);
-void bigintMul_TAB(BigInt&,BigInt&,BigInt&);
-//void bigintMul_digit_TDA(BigInt&,int64_t&,BigInt&);
-void bigintMul_digit_TDA(BigInt&,int32_t&,BigInt&);
-void bigintAdd_TAB(BigInt&,BigInt&,BigInt&);
-void bigintAdd_abs_TAB(BigInt&,BigInt&,BigInt&);
-void bigintSub_TAB(BigInt&,BigInt&,BigInt&);
-void bigintSub_abs_TAB(BigInt&,BigInt&,BigInt&);
-void bigintSub_abs_ovgl_TAB(BigInt&,BigInt&,BigInt&);
-int8_t bigintVgl_AB(BigInt&,BigInt&);
-int8_t bigintVgl_abs_AB(BigInt&,BigInt&);
-
-
-// globals
-
+inline void bigintDiv_TRAB(BigInt&,BigInt&,BigInt&,BigInt&);
+inline void bigintMul_TAB(BigInt&,BigInt&,BigInt&);
+inline void bigintMul_digit_TDA(BigInt&,int32_t&,BigInt&);
+inline void bigintAdd_TAB(BigInt&,BigInt&,BigInt&);
+inline void bigintAdd_abs_TAB(BigInt&,BigInt&,BigInt&);
+inline void bigintSub_TAB(BigInt&,BigInt&,BigInt&);
+inline void bigintSub_abs_TAB(BigInt&,BigInt&,BigInt&);
+inline void bigintSub_abs_ovgl_TAB(BigInt&,BigInt&,BigInt&);
+inline int8_t bigintVgl_AB(BigInt&,BigInt&);
+inline int8_t bigintVgl_abs_AB(BigInt&,BigInt&);
 inline int32_t sum_int32t(const int32_t,const int32_t);
 
 
@@ -159,24 +154,10 @@ void BigInt::load(FILE* f) {
 	}
 	
 	for(int32_t i=0;i<=highestusedidx;i++) {
-		#ifdef _READMATRIX64
-		int64_t w;
-		if (fread(&w,1,sizeof(w),f) != sizeof(w)) {
-			LOGMSG("\nError. Reading bigint. Probably invalid matrix file. Deleting recommended.\n");
-			exit(99);
-		}
-		if (w > INT31MAX) {
-			LOGMSG2("\nError. Converting. BigInt:load: %I64d\n",w);
-			exit(99);
-		}
-		digits[i]=w;
-		#endif
-		#ifndef _READMATRIX64
 		if (fread(&digits[i],1,sizeof(digits[i]),f) != sizeof(digits[i])) {
 			LOGMSG("\nError. Reading bigint. Probably invalid matrix file. Deleting recommended.\n");
 			exit(99);
 		}
-		#endif
 	} // i
 }
 
@@ -309,7 +290,11 @@ void BigInt::getStr(DynSlowString& erg) {
 
 	for(int32_t i=highestusedidx;i>=0;i--) {
 		if (i != highestusedidx) {
-			sprintf(tmp,"%09i",digits[i]);
+			if (BIGINTBASE == 1000000000) {
+				sprintf(tmp,"%09i",digits[i]);
+			} else {
+				sprintf(tmp,"/%i/",digits[i]);
+			}
 		}
 		else sprintf(tmp,"%i",digits[i]);
 		erg.add(tmp);
@@ -391,6 +376,11 @@ void bigintMul_digit_TDA(
 		return;
 	}
 	
+	int32_t signD;
+	if (D < 0) signD=-1;
+	else if (D == 0) signD=0;
+	else if (D > 0) signD=1;
+	
 	// conservatively judged
 	// current highstusedidx is smaller, so adding 1 does not overflow
 	if ( (A.highestusedidx+1) >= MAXBIGINTDIGITS) {
@@ -455,9 +445,11 @@ void bigintMul_digit_TDA(
 		}
 	} // idxa
 	
+	// res sign: sign(T)*sign(A)
+	
 	for(int32_t i=(A.highestusedidx+1);i>=0;i--) {
 		if (res.digits[i] > 0) {
-			res.vorz=1;
+			res.vorz=A.vorz * signD;
 			res.highestusedidx=i;
 			return;
 		}
@@ -483,7 +475,6 @@ void bigintMul_TAB(
 		return;
 	}
 	
-	res.vorz=A.vorz*B.vorz;
 	int32_t w=A.highestusedidx+B.highestusedidx;
 	if (w >= MAXBIGINTDIGITS) {
 		// might work for some combinations of numbers at those
@@ -517,12 +508,12 @@ void bigintMul_TAB(
 		// add to res
 		BigInt tmp2;
 		bigintAdd_abs_TAB(tmp2,res,tmp);
-		res=tmp2;
+		res.copyFrom(tmp2);
 		
 	} // idxa
 	
 	res.vorz=A.vorz*B.vorz;
-
+	
 }
 
 void bigintAdd_TAB(
@@ -777,13 +768,13 @@ void bigintSub_abs_ovgl_TAB(
 	if (B.highestusedidx > m) m=B.highestusedidx;
 	
 	for(int32_t i=0;i<=m;i++) {
-		int64_t a,b;
-		if (i <= A.highestusedidx) a=(int64_t)A.digits[i]; else a=0;
-		if (i <= B.highestusedidx) b=(int64_t)B.digits[i]; else b=0;
+		int64_t vala,valb;
+		if (i <= A.highestusedidx) vala=(int64_t)A.digits[i]; else vala=0;
+		if (i <= B.highestusedidx) valb=(int64_t)B.digits[i]; else valb=0;
 		// as only 32 bits in digits and carry-over are used at max
 		// there is no overflow or underflow by adding or subtracting
 		// up to 3 numbers int int64_t
-		int64_t w=a - (b + carryover);
+		int64_t w=vala - (valb + carryover);
 		if (w < 0) {
 			w += (int64_t)BIGINTBASE;
 			if (w < 0) {
@@ -811,7 +802,12 @@ void bigintSub_abs_ovgl_TAB(
 	}
 	
 	if (carryover != 0) {
-		LOGMSG("\nError. Overflow bigint_sub_abs_ovgl\n");
+		LOGMSG2("\nError. Overflow bigint_sub_abs_ovgl. highestusedidx=%i but still carry-over\n",
+			res.highestusedidx);
+		LOGMSG("\n|A| (ignore sign): "); A.ausgabe(stdout);
+		A.ausgabe(flog);
+		LOGMSG("\n minus |B| (ignore sign): "); B.ausgabe(stdout);
+		B.ausgabe(flog);
 		exit(99);
 	}
 	
@@ -872,7 +868,11 @@ void BigInt::ausgabe(FILE *f) {
 	
 	for(int32_t i=highestusedidx;i>=0;i--) {
 		if (i != highestusedidx) {
-			fprintf(f,"%09i",digits[i]);
+			if (BIGINTBASE == 1000000000) {
+				fprintf(f,"%09i",digits[i]);
+			} else {
+				fprintf(f,"/%i/",digits[i]);
+			}
 		} else fprintf(f,"%i",digits[i]);
 	}
 }
