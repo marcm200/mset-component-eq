@@ -22,7 +22,9 @@ the code comes with no warranty.
 
 ### Update history
 
-2020-09-11 added checks for very small chunk sizes and array settings that can lead to memory failure
+2020 09-14: added openMP support for polynomial multiplication
+2020 09-14: sorted list to store polynomial coefficients to allow binary search
+2020-09-11: added checks for very small chunk sizes and array settings 
 
 
 ### Overview
