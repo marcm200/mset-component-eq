@@ -19,6 +19,8 @@
 	Marc Meidlinger
 	August-September 2020
 	
+	2020 09-14: added openMP support for polynomial multiplication,
+		   sorted list to store polynomial coefficients to allow binary search
 	2020-09-11: added checks for very small chunk sizes
 	
 */
@@ -29,14 +31,22 @@
 #include "string.h"
 #include "math.h"
 #include "time.h"
+#include "omp.h"
 
 
 // defines as compiler switches
 
 // verifies certain claims during computation
-#define _INVOKECLAIMVERIFICATIONS
+// e.g. remainder of division < divisior
+// jump shortcut in division does not overshoot etc
+// sign and result check for bigint divion
+// satisfying the result equations
 
-// globals	
+//#define _INVOKECLAIMVERIFICATIONS
+
+	
+// defines as small functions
+
 FILE *flog=NULL;
 
 #define LOGMSG(TT) \
@@ -75,22 +85,25 @@ FILE *flog=NULL;
 	}\
 }
 
-#define INC64(VV) \
+#define TIMEOUT(TT,TIMESPEC,TIMEALL) \
 {\
-	if (VV > INT62MAX) {\
-		LOGMSG("\nError. Inc var64 too large.\n");\
-		exit(99);\
-	}\
-	VV++;\
+	double lokald=100.0*(double)(TIMESPEC)/(TIMEALL);\
+	LOGMSG2("\n%3.0lf%% ",lokald);\
+	LOGMSG4("(clocks in %s %i <-> all %i)",\
+		TT,TIMESPEC,TIMEALL);\
 }
 
 
 // consts
 
+const int32_t MAXKEYS=2048;
 const int32_t INIT_ZMCTERMS=128; // initial terms
 const int32_t MAXDIMENSION=(int32_t)1 << 14;
 const int32_t MAXDEGREE=(int32_t)1 << 13;
-const int32_t MAXTERMSPERPOLYNOM=(int32_t)1 << 28;
+
+// needs to be a value < 2^30, so doubling fits into
+// signed int32_t
+const int32_t MAXTERMSPERPOLYNOM=(int32_t)1 << 20;
 
 const int32_t MAXPTR=2048; // allocated chunks
 const int32_t UINT30MAX=((int32_t)1 << 30) - 1;
@@ -106,7 +119,6 @@ const int64_t CHUNKSIZE=(int64_t)1 << 27;
 
 // structs
 
-// dynamical string
 struct DynSlowString {
 	int32_t memory;
 	char* text;
@@ -120,10 +132,9 @@ struct DynSlowString {
 	void setEmpty(void);
 };
 
-// big integer
 #include "bigint.cpp"
 
-// polynomial term: stores (positive) integer exponents of Z,M,C 
+// polynom: stores (positive) integer exponents of Z,M,C 
 // variables and a BigInt factor
 
 struct ZMCterm {
@@ -142,29 +153,32 @@ struct ZMCterm {
 typedef ZMCterm *PZMCterm;
 typedef PZMCterm *PPZMCterm;
 
-// memory manager for the polynomial terms themselves
 struct ZMCtermMemoryManager {
 	ZMCterm* current;
 	int32_t allocatedIdx,freeFromIdx,allocatePerBlockIdx;
 	PZMCterm ptr[MAXPTR];
 	int32_t anzptr;
+	int64_t memory;
 	
 	ZMCtermMemoryManager();
+	ZMCtermMemoryManager(const int64_t);
 	virtual ~ZMCtermMemoryManager();
 	ZMCterm* getMemory(const int32_t);
 	
 	void freePhysically(void);
 };
 
-// memory manager for arrays of pointers to the terms
 struct PZMCtermMemoryManager {
 	PZMCterm* current;
 	int32_t allocatedIdx,freeFromIdx,allocatePerBlockIdx;
 	PPZMCterm ptr[MAXPTR];
 	int32_t anzptr;
+	int64_t memory;
 	
 	PZMCtermMemoryManager();
+	PZMCtermMemoryManager(const int64_t);
 	virtual ~PZMCtermMemoryManager();
+	
 	PZMCterm* getMemory(const int32_t);
 	
 	void freePhysically(void);
@@ -178,6 +192,8 @@ struct ZMCpolynom {
 	/* decreased, when eg. a term vanishes */
 	int32_t Zdegree; /* highest power of Z */
 	int32_t Mdegree,Cdegree;
+	int8_t mighthaveremoveablezeroterms; // 0 => definitely none, 1 => may or may not
+	
 	PZMCterm *terms; // array of pointers
 	ZMCtermMemoryManager *tmgr;
 	PZMCtermMemoryManager *ptmgr;
@@ -194,13 +210,15 @@ struct ZMCpolynom {
 	void load(FILE*);
 	void jumpOverLoad(FILE*);
 	int8_t isZero(void);
-	void checkDegree(void);
 	int8_t isPositiveOne(void);
+	int8_t searchBy_TZMC(int32_t&,const int32_t,const int32_t,const int32_t);
+	void checkDegree(void);
 	void setToPositiveOne(void);
 	void addTerm_FZMC(BigInt&,const int32_t,const int32_t,const int32_t);
 	void addTerm_FZMC(const int64_t,const int32_t,const int32_t,const int32_t);
 	void subTerm_FZMC(BigInt&,const int32_t,const int32_t,const int32_t);
 	void addTerm_FZMC(ZMCterm&);
+	void addTermLast_FZMC(ZMCterm&);
 	void subTerm_FZMC(ZMCterm&);
 	void subTerm_FZMC(const int64_t,const int32_t,const int32_t,const int32_t);
 	void subPoly(ZMCpolynom&);
@@ -213,6 +231,7 @@ struct ZMCpolynom {
 };
 
 typedef ZMCpolynom *PZMCpolynom;
+
 
 // square matrix with ZMCpolynomial pointers as entry
 // those pointers are seen as having a constant content
@@ -234,57 +253,65 @@ struct MatrixPolynom {
 	int8_t entryPositiveOne_YX(const int32_t,const int32_t);
 	void save(const char*);
 	void load(const char*,const int32_t,const int32_t);
+	void loadRowCol(const char*,const int32_t,const int32_t);
 };
 
 typedef MatrixPolynom *PMatrixPolynom;
 
+// holds on open file for reading a polynomial
+// from a matrix on hard disc, mainly used for
+// sequential reading of one polynomial after
+// the other, jumping over some
+struct MatrixLoader {
+	FILE *f;
+	char fn[1024];
+	int32_t dim;
+	int32_t currentposx,currentposy; // the current position
+	// at which the polynomial in the matrix y,x starts
+	
+	MatrixLoader();
+	virtual ~MatrixLoader();
+	
+	void prepareForLoading(const char*);
+	void close(void);
+	int8_t loadAtYX(ZMCpolynom&,const int32_t,const int32_t);
+};
+
+
 // forward declarations
+
 inline void termMul_TAB(ZMCterm&,ZMCterm&,ZMCterm&);
 inline void polynomMul_TAB(ZMCpolynom&,ZMCpolynom&,ZMCpolynom&);
+inline void polynomMul_TTermB(ZMCpolynom&,ZMCterm&,ZMCpolynom&);
 inline void polynomDiv_rf_TRAB(ZMCpolynom&,ZMCpolynom&,ZMCpolynom&,ZMCpolynom&,ZMCpolynom&,ZMCpolynom&,ZMCpolynom&,ZMCpolynom&);
-inline void polynomComposition_at_Z_TNA(ZMCpolynom&,const int32_t,ZMCpolynom&);
-inline void polynomPow_TNA(ZMCpolynom&,const int32_t,ZMCpolynom&);
-inline void polynomDer_at_Z_TA(ZMCpolynom&,ZMCpolynom&);
-/*
-			
-	during and after computation (polynoimMul, Div etc) is),
-	it shall not be assumed that the order of terms of the
-	argument polynomials be the same as before
-	
-*/
+
+void polynomComposition_at_Z_TNA(ZMCpolynom&,const int32_t,ZMCpolynom&);
+void polynomPow_TNA(ZMCpolynom&,const int32_t,ZMCpolynom&);
+void polynomDer_at_Z_TA(ZMCpolynom&,ZMCpolynom&);
 
 inline int32_t sum_int32t(const int32_t,const int32_t);
-		
-// globals
-int32_t currentperiod=1;
-int8_t MULTIBROT=2; 
-ZMCpolynom basefkt; 
-ZMCpolynom fstrictP,fderm; // memory manager will be set later
+int8_t loadPolynomialFromMatrix_FTYX(const char*,ZMCpolynom&,const int32_t,const int32_t);
+inline int8_t exponentVgl_AB(ZMCterm&,const int32_t,const int32_t,const int32_t);
 
-// memory managers
+
+// globals
+
+int8_t MULTIBROT=2; 
+ZMCpolynom basefkt; // memory manager will be set later
+
+// memory manager
 ZMCtermMemoryManager globalzmctermmgr;
 PZMCtermMemoryManager globalpzmctermmgr;
 
-// general
 BigInt big1;
-char fnbase[256];
+char fnbase[1024];
+ZMCpolynom fstrictP,fderm; // memory manager will be set later
+int32_t currentperiod=1;
 
 
 // routines
 
 // general
-char* chomp(char* s) {
-	if (!s) return 0;
-	for(int32_t i=strlen(s);i>=0;i--) if (s[i]<32) s[i]=0; else break;
-	return s;
-}
-
-inline void swapTermPtr(PZMCterm& a,PZMCterm& b) {
-	PZMCterm c=a;
-	a=b;
-	b=c;
-}
-
 inline int32_t sum_int32t(
 	const int32_t a,
 	const int32_t b
@@ -309,12 +336,6 @@ char* upper(char* s) {
 	}
 
 	return s;
-}
-
-inline void swapInt(int32_t& a,int32_t& b) {
-	int32_t c=a;
-	a=b;
-	b=c;
 }
 
 // polynomial
@@ -356,6 +377,7 @@ void ZMCpolynom::load(FILE* f) {
 		LOGMSG("\nError. Reading polynomial. Probably invalid matrix file. Deleting recommended.\n");
 		exit(99);
 	}
+	
 	clearTerms();
 	
 	if (anz == 0) {
@@ -450,37 +472,38 @@ void ZMCpolynom::copyFrom(ZMCpolynom& A) {
 }
 
 void ZMCpolynom::removeZeroTerms(void) {
+	if (mighthaveremoveablezeroterms <= 0) return; // free
+	
 	// if one term with zero present => keep it
-	if (anzterms <= 1) return;
+	if (anzterms <= 1) {
+		mighthaveremoveablezeroterms=0;
+		return;
+	}
 	
-	// it might happen that by adding/subtracting
-	//  terms with factor 0 emerge
-	// those will be removed from the term list
-	int32_t idx=0;
-	
-	while (idx<anzterms) {
-		// is [idx] a zero term
-		if (terms[idx]->factor.vorz == 0) {
-			// copy term from end of list
-			if ((anzterms-1) != idx) {
-				swapTermPtr(terms[idx],terms[anzterms-1]);
-			} 
-			
-			anzterms--;
-			// the pointer is still a validly allocated
-			// memory part and can be reused if adding terms
-			// requires more => not setting to NULL
-			
-			if (anzterms == 1) break; // not zero, the last 0 should be kept if present
-			
-			continue; // no idx increase
+	int32_t s0=anzterms-1;
+	while (anzterms > 0) {
+		int32_t f0=-1;
+		for(int32_t i=s0;i>=0;i--) {
+			if (terms[i]->factor.vorz == 0) {
+				f0=i;
+				break;
+			}
+		} // i
+		
+		if (f0 < 0) break;
+		// [f0] is zero
+		// shift everyting from [f0+1..anzterms[ one to the left
+		ZMCterm* p=terms[f0];
+		for(int32_t k=f0;k<(anzterms-1);k++) {
+			terms[k]=terms[k+1];
 		}
-		
-		idx++;
-		
-		if (anzterms == 1) break;
-		
+		terms[anzterms-1]=p;
+		anzterms--;
+		s0=f0; // can't be zero again
+		if (s0 >= anzterms) s0=anzterms-1;
 	} // while
+	
+	mighthaveremoveablezeroterms=0;
 	
 }
 
@@ -491,7 +514,6 @@ void ZMCpolynom::ausgabe(FILE* f) {
 	getStr(one);
 	fprintf(f,"%s",one.text);
 }
-
 int8_t ZMCpolynom::isZero(void) {
 	if (anzterms == 0) return 1;
 	
@@ -544,6 +566,7 @@ void ZMCpolynom::getStr(DynSlowString& erg) {
 		terms[i]->getStr(one);
 		erg.add(one);
 	}
+	
 }
 
 void ZMCpolynom::addTerm_FZMC(
@@ -570,12 +593,17 @@ void ZMCpolynom::subPoly(ZMCpolynom& b) {
 	for(int32_t i=0;i<b.anzterms;i++) {
 		subTerm_FZMC(*b.terms[i]);
 	}
+
+	removeZeroTerms();
+
 }
 
 void ZMCpolynom::addPoly(ZMCpolynom& b) {
 	for(int32_t i=0;i<b.anzterms;i++) {
 		addTerm_FZMC(*b.terms[i]);
 	}
+	
+	removeZeroTerms();
 }
 
 void ZMCpolynom::subTerm_FZMC(
@@ -590,28 +618,144 @@ void ZMCpolynom::subTerm_FZMC(
 	subTerm_FZMC(w,aZexp,aMexp,aCexp);
 }
 
+int8_t ZMCpolynom::searchBy_TZMC(
+	int32_t &idx,
+	const int32_t az,
+	const int32_t am,
+	const int32_t ac
+) {
+	idx=-1;
+	if (anzterms <= 0) {
+		// add at end
+		return 0;
+	}
+	
+	// if the rightest term is still not larger
+	// add at end
+	int8_t vgl=exponentVgl_AB(*terms[anzterms-1],az,am,ac);
+	if (vgl == 0) {
+		// found it
+		idx=anzterms-1;
+		return 1;
+	}
+	if (vgl < 0) {
+		// new element azam,ac is even larger
+		// (In the exponent ordering sense)
+		idx=-1; // add at end
+		return 0;
+	}
+	
+	int32_t right=anzterms-1;
+	
+	// now it holds through the rest of the routine
+	// (az,ammac) < [right] 
+	
+	vgl=exponentVgl_AB(*terms[0],az,am,ac);
+	if (vgl == 0) {
+		// found it
+		idx=0;
+		return 1;
+	}
+	if (vgl > 0) {
+		// even smallest element in list is larger than
+		// the new one: insert at first position
+		idx=0;
+		return 0;
+	}
+	
+	int32_t left=0;
+	// it holds throughout: [left] < (az,am,ac)
+	
+	// binary search
+
+	while (1) {
+		int32_t len=sum_int32t( (right-left), 1 ); // no overflow possible here
+		if (len <= 4) {
+			// left, right are strict smaller/larger
+			for(int32_t i=left;i<=right;i++) {
+				int8_t vgl=exponentVgl_AB(*terms[i],az,am,ac);
+				if (vgl == 0) {
+					idx=i;
+					return 1;
+				}
+				if (vgl > 0) {
+					idx=i;
+					return 0;
+				}
+			} // i
+			
+			// shall not occur
+			LOGMSG("\nImplementation error. binary search\n");
+			exit(99);
+		} // small region where az,amac could be
+		
+		int32_t middle=sum_int32t(left,right) >> 1;
+		
+		vgl=exponentVgl_AB(*terms[middle],az,am,ac);
+		if (vgl == 0) {
+			// found it
+			idx=middle;
+			return 1;
+		}
+		
+		if (vgl > 0) {
+			right=middle; // loop invariant holds still
+		} else if (vgl < 0) {
+			left=middle; // loop invariant holds
+		}
+		
+	} // while
+	
+	// shall not occar
+	LOGMSG("\nImplementation error. Outside loop search\n");
+	exit(99);
+	
+}
+
+inline int8_t exponentVgl_AB(
+	ZMCterm& A,
+	const int32_t bz,
+	const int32_t bm,
+	const int32_t bc
+) {
+	if (A.Zexponent > bz) return +1;
+	if (A.Zexponent < bz) return -1;
+	
+	if (A.Mexponent > bm) return +1;
+	if (A.Mexponent < bm) return -1;
+
+	if (A.Cexponent > bc) return +1;
+	if (A.Cexponent < bc) return -1;
+	
+	return 0;
+}
+
 void ZMCpolynom::addTerm_FZMC(
 	BigInt& afactor,
 	const int32_t aZexp, /* exponent of Z-variable */
 	const int32_t aMexp,
 	const int32_t aCexp
 ) {
+	
 	if (!terms) {
 		initMemory();
 		anzterms=0;
 	}
-
-	for(int32_t i=0;i<anzterms;i++) {
-		if (
-			(terms[i]->Zexponent == aZexp) &&
-			(terms[i]->Mexponent == aMexp) && 
-			(terms[i]->Cexponent == aCexp) 
-		) {
-			// already one present, add BigInt numbers
-			terms[i]->factor.addTo(afactor);
+	
+	int32_t eidx;
+	int8_t searched=searchBy_TZMC(eidx,aZexp,aMexp,aCexp);
+	
+	if (searched > 0) {
+		//printf("found at %i\n",eidx);
+		if (eidx >= 0) {
+			terms[eidx]->factor.addTo(afactor);
+			if (terms[eidx]->factor.vorz == 0) mighthaveremoveablezeroterms=1;
 			return; // done
+		} else {
+			LOGMSG("\nError. eids negative.\n");
+			exit(99);
 		}
-	} // i
+	}
 	
 	// new Z-term
 	if (anzterms > (allocatedterms-8)) {
@@ -629,12 +773,15 @@ void ZMCpolynom::addTerm_FZMC(
 			exit(99);
 		}
 		terms=ptmgr->getMemory(allocatedterms);
+		
 		if (!terms) {
 			LOGMSG("\nError. Memory. ZMCpolynom::addTerm_Z_MCpoly\n");
 			exit(99);
 		}
 
-		// copy used terms, oldalloc instead of anzterms to copy NIL pointers
+		// copy used terms
+		// oldalloc instead of anzterms, so NIL-pointers
+		// are copied from the initial array
 		for(int32_t i=0;i<oldalloc;i++) {
 			terms[i]=old[i];
 		}
@@ -649,37 +796,167 @@ void ZMCpolynom::addTerm_FZMC(
 		for(int32_t i=oldalloc;i<allocatedterms;i++) {
 			terms[i]=NULL;
 		}
-		
-		// old term-array will be destroyed when the corresponding
-		// memory manager is freed
-		
-	}
+	
+	} // expand array of zmc pointers
 	
 	if (anzterms > (MAXTERMSPERPOLYNOM-16)) {
 		LOGMSG("\nError. Memory. Too many terms in a polynomial.\n");
 		exit(99);
 	}
 	
-	if (!terms[anzterms]) {
+	// terms[anzterms]: is a valid index
+	int32_t insertat=-1;
+	if (searched <= 0) {
+		if (eidx >= 0) {
+			insertat=eidx;
+		}
+	}
+	
+	if (insertat < 0) insertat=anzterms;
+	else {
+		// shift pointers {insertat..anzterms[ one
+		// to the right
+		ZMCterm* p=terms[anzterms]; // new position
+		for(int32_t k=anzterms;k>insertat;k--) {
+			terms[k]=terms[k-1];
+		} // k
+		terms[insertat]=p;
+	}
+	
+	anzterms=sum_int32t(anzterms,1);
+	
+	if (!terms[insertat]) {
 		// get an actual object from the 2nd memory manager
-		terms[anzterms]=tmgr->getMemory(1);
-		if (!terms[anzterms]) {
+		terms[insertat]=tmgr->getMemory(1);
+		if (!terms[insertat]) {
 			LOGMSG("\nError. Memory. polynom::add. tmgr cannot hand out more terms\n");
 			exit(99);
 		} 
 	}
 	
 	// valid pointer
-	terms[anzterms]->factor.copyFrom(afactor);
-	terms[anzterms]->Zexponent=aZexp;
-	terms[anzterms]->Mexponent=aMexp;
-	terms[anzterms]->Cexponent=aCexp;
-	anzterms++; // no overflow as checked above
+	terms[insertat]->Zexponent=aZexp;
+	terms[insertat]->Mexponent=aMexp;
+	terms[insertat]->Cexponent=aCexp;
+	terms[insertat]->factor.copyFrom(afactor);
 	
 	if (aZexp > Zdegree) Zdegree=aZexp;
 	if (aMexp > Mdegree) Mdegree=aMexp;
 	if (aCexp > Cdegree) Cdegree=aCexp;
+	
+	#ifdef _INVOKECLAIMVERIFICATIONS
+	for(int32_t i=1;i<anzterms;i++) {
+		if (exponentVgl_AB(*terms[i-1],terms[i]->Zexponent,terms[i]->Mexponent,terms[i]->Cexponent) >= 0) {
+			printf("\nError order\n");
+			for(int32_t k=0;k<anzterms;k++) {
+				printf("#%i: %i,%i,%i\n",
+					k,
+					terms[k]->Zexponent,
+					terms[k]->Mexponent,
+					terms[k]->Cexponent);
+			}
+			exit(99);
+		}
+	}
+	#endif
+	
+}
 
+void ZMCpolynom::addTermLast_FZMC(
+	ZMCterm& A
+) {
+	// adds the term to the current term list
+	// degree is adju
+	
+	if (!terms) {
+		initMemory();
+		anzterms=0;
+	}
+	
+	// new Z-term
+	if (anzterms > (allocatedterms-8)) {
+		// allocate new memory and copy all pointers
+		PZMCterm *old=terms;
+		
+		if (allocatedterms >= MAXTERMSPERPOLYNOM) {
+			LOGMSG("\nError. Memory. Too many terms requested.\n");
+			exit(99);
+		}
+		int32_t oldalloc=allocatedterms;
+		allocatedterms = sum_int32t(allocatedterms,allocatedterms);
+		if ( (!tmgr) || (!ptmgr) ) {
+			LOGMSG("\nError. Implementation. ZMCpolynom::addTerm.mgr pointer NIL\n");
+			exit(99);
+		}
+		terms=ptmgr->getMemory(allocatedterms);
+		
+		if (!terms) {
+			LOGMSG("\nError. Memory. ZMCpolynom::addTerm_Z_MCpoly\n");
+			exit(99);
+		}
+
+		// copy used terms
+		// oldalloc instead of anzterms, so NIL-pointers
+		// are copied from the initial array
+		for(int32_t i=0;i<oldalloc;i++) {
+			terms[i]=old[i];
+		}
+		
+		// do not start setting pointers to NULL from
+		// anzterms as ZMCpolynom could be in reuse, already
+		// having still valid pointers to memory used
+		// in a former usage of the polynomial
+		// so only the new allocated pointer region
+		// is set to NULL
+
+		for(int32_t i=oldalloc;i<allocatedterms;i++) {
+			terms[i]=NULL;
+		}
+	
+	} // expand array of zmc pointers
+	
+	if (anzterms > (MAXTERMSPERPOLYNOM-16)) {
+		LOGMSG("\nError. Memory. Too many terms in a polynomial.\n");
+		exit(99);
+	}
+	
+	// terms[anzterms]: is a valid index
+	int32_t insertat=anzterms;
+
+	anzterms=sum_int32t(anzterms,1);
+	
+	if (!terms[insertat]) {
+		// get an actual object from the 2nd memory manager
+		terms[insertat]=tmgr->getMemory(1);
+		if (!terms[insertat]) {
+			LOGMSG("\nError. Memory. polynom::add. tmgr cannot hand out more terms\n");
+			exit(99);
+		} 
+	}
+	
+	// valid pointer
+	terms[insertat]->copyFrom(A);
+	
+	if (A.Zexponent > Zdegree) Zdegree=A.Zexponent ;
+	if (A.Mexponent > Mdegree) Mdegree=A.Mexponent ;
+	if (A.Cexponent > Cdegree) Cdegree=A.Cexponent ;
+	
+	#ifdef _INVOKECLAIMVERIFICATIONS
+	for(int32_t i=1;i<anzterms;i++) {
+		if (terms[i-1]->Zexponent > terms[i]->Zexponent) {
+			printf("\nError order\n");
+			for(int32_t k=0;k<anzterms;k++) {
+				printf("#%i: %i,%i,%i\n",
+					k,
+					terms[k]->Zexponent,
+					terms[k]->Mexponent,
+					terms[k]->Cexponent);
+			}
+			exit(99);
+		}
+	}
+	#endif
+	
 }
 
 void ZMCpolynom::subTerm_FZMC(
@@ -724,6 +1001,7 @@ ZMCpolynom::ZMCpolynom() {
 	tmgr=NULL;
 	ptmgr=NULL;
 	ALLOCATEINITIALLY=INIT_ZMCTERMS;
+	mighthaveremoveablezeroterms=0;
 }
 
 ZMCpolynom::ZMCpolynom(
@@ -737,6 +1015,8 @@ ZMCpolynom::ZMCpolynom(
 	terms=NULL;
 	tmgr=t;
 	ptmgr=p;
+	mighthaveremoveablezeroterms=0;
+	
 	if (am < 16) ALLOCATEINITIALLY=INIT_ZMCTERMS;
 	else ALLOCATEINITIALLY=am;
 }
@@ -762,6 +1042,7 @@ ZMCpolynom::~ZMCpolynom() {
 void ZMCpolynom::clearTerms(void) {
 	anzterms=0;
 	Zdegree=Mdegree=Cdegree=0;
+	mighthaveremoveablezeroterms=0;
 }
 
 void ZMCpolynom::setMemoryManager(
@@ -775,6 +1056,7 @@ void ZMCpolynom::setMemoryManager(
 // memory manager
 ZMCtermMemoryManager::ZMCtermMemoryManager() {
 	current=NULL;
+	memory=0;
 	allocatedIdx=0;
 	freeFromIdx=-1;
 	double d=CHUNKSIZE; 
@@ -782,6 +1064,18 @@ ZMCtermMemoryManager::ZMCtermMemoryManager() {
 	allocatePerBlockIdx=(int32_t)floor(d);
 	anzptr=0;
 }
+
+ZMCtermMemoryManager::ZMCtermMemoryManager(const int64_t membytes) {
+	current=NULL;
+	memory=0;
+	allocatedIdx=0;
+	freeFromIdx=-1;
+	double d=membytes; 
+	d /= sizeof(ZMCterm);
+	allocatePerBlockIdx=(int32_t)floor(d);
+	anzptr=0;
+}
+
 
 ZMCterm* ZMCtermMemoryManager::getMemory(const int32_t aanz) {
 	if (
@@ -793,6 +1087,7 @@ ZMCterm* ZMCtermMemoryManager::getMemory(const int32_t aanz) {
 			exit(99);
 		}
 		ptr[anzptr]=current=new ZMCterm[allocatePerBlockIdx];
+		memory += (sizeof(ZMCterm)*allocatePerBlockIdx);
 		anzptr++; // no overflow as checked above
 		if (!current) {
 			LOGMSG("Error/2. ZMCtermMemoryManager.\n");
@@ -809,7 +1104,7 @@ ZMCterm* ZMCtermMemoryManager::getMemory(const int32_t aanz) {
 		LOGMSG("\nError. ZMCtermMemorymanager. Requested size larger than page.\n");
 		exit(99);
 	}
-
+	
 	return p;
 }
 
@@ -818,7 +1113,7 @@ void ZMCtermMemoryManager::freePhysically(void) {
 	for(int32_t i=0;i<anzptr;i++) {
 		if (ptr[i]) delete[] ptr[i];
 	}
-	
+	memory=0;
 	current=NULL;
 	allocatedIdx=0;
 	freeFromIdx=-1;
@@ -832,9 +1127,21 @@ ZMCtermMemoryManager::~ZMCtermMemoryManager() {
 // memory manager
 PZMCtermMemoryManager::PZMCtermMemoryManager() {
 	current=NULL;
+	memory=0;
 	allocatedIdx=0;
 	freeFromIdx=-1;
 	double d=CHUNKSIZE; 
+	d /= sizeof(PZMCterm);
+	allocatePerBlockIdx=(int32_t)floor(d);
+	anzptr=0;
+}
+
+PZMCtermMemoryManager::PZMCtermMemoryManager(const int64_t memsz) {
+	current=NULL;
+	memory=0;
+	allocatedIdx=0;
+	freeFromIdx=-1;
+	double d=memsz; 
 	d /= sizeof(PZMCterm);
 	allocatePerBlockIdx=(int32_t)floor(d);
 	anzptr=0;
@@ -850,6 +1157,7 @@ PZMCterm* PZMCtermMemoryManager::getMemory(const int32_t aanz) {
 			exit(99);
 		}
 		ptr[anzptr]=current=new PZMCterm[allocatePerBlockIdx];
+		memory += (sizeof(PZMCterm)*allocatePerBlockIdx);
 		anzptr++; // no overflow as checked above
 		if (!current) {
 			LOGMSG("Error/2. PZMCtermMemoryManager.\n");
@@ -875,6 +1183,7 @@ void PZMCtermMemoryManager::freePhysically(void) {
 	for(int32_t i=0;i<anzptr;i++) {
 		if (ptr[i]) delete[] ptr[i];
 	}
+	memory=0;
 	
 	current=NULL;
 	allocatedIdx=0;
@@ -892,19 +1201,16 @@ void getStrictPeriod_TP(
 ) {
 	/*
 	
-		INFO:
-	
-		inefficient first implementation
 		computes recursively all sub-strict periods
-		even if they are necessary multiple times
+		even if they are necessarsy multiple times
 		
-		almost all computational time is spent in
-		computing the determinant
+		no bottleneck as almost all computational time 
+		is spent in	computing the determinant
 	
 	*/
 	
-	// computes basefkt[comp P-fold]-z) 
-	// product strictP' with P' truely dividing P (1 included, but not P)
+	// computss basefkt[comp P-fold]-z) 
+	// / product strictP' with P' truely dividing P (1 included, but not P)
 	
 	ZMCpolynom fcompP(astrictp.tmgr,astrictp.ptmgr,-1),
 		product(astrictp.tmgr,astrictp.ptmgr,-1),
@@ -919,6 +1225,7 @@ void getStrictPeriod_TP(
 	for(int32_t dividing=1;dividing<period;dividing++) {
 		if ( (period % dividing) != 0) continue;
 		
+		//printf("\n  dividing %i\n",dividing);
 		getStrictPeriod_TP(substrict,dividing);
 		polynomMul_TAB(tmp,substrict,product);
 		product.copyFrom(tmp);
@@ -940,12 +1247,12 @@ void getStrictPeriod_TP(
 	}
 	
 	#ifdef _INVOKECLAIMVERIFICATIONS
-	// Check: fstrictP*product-fcompP = 0
+	// Gegenprobe: fstrictP*product-fcompP = 0
 	ZMCpolynom p1(astrictp.tmgr,astrictp.ptmgr,-1);
 	polynomMul_TAB(p1,astrictp,product);
 	p1.subPoly(fcompP);
 	if (p1.isZero() <= 0) {
-		LOGMSG("\nError. Implementation. Check fstrictP incorrect.\n");
+		LOGMSG("\nError. Implementation. Gegenprobe fstrictP incorrect.\n");
 		exit(99);
 	}
 	#endif
@@ -958,12 +1265,14 @@ void setPeriod(const int32_t aper) {
 	ZMCpolynom fcomp(&globalzmctermmgr,&globalpzmctermmgr,-1);
 	polynomComposition_at_Z_TNA(fcomp,aper,basefkt);
 	
+	LOGMSG3("|-> %i-composition f_o%i(z)=",currentperiod,currentperiod); 
+	fcomp.ausgabe(stdout);
+	fcomp.ausgabe(flog);
+	
 	// derivative
 	fderm.setMemoryManager(&globalzmctermmgr,&globalpzmctermmgr);
 	polynomDer_at_Z_TA(fderm,fcomp);
 	fderm.addTerm_FZMC(-1,0,1,0); // -m
-	
-	fderm.ausgabe(stdout);
 	
 	// computes recursively the necessary strictP subperiodic
 	// polynomials and their compositions
@@ -1144,6 +1453,14 @@ void DynSlowString::add(DynSlowString& as) {
 	if (as.text) add(as.text);
 }
 
+void resultantZ_tgtAB(
+	ZMCpolynom& fres,
+	ZMCpolynom& f,
+	ZMCpolynom& g
+) {
+	fres.clearTerms();
+}
+
 ZMCpolynom* getZcoeff(ZMCpolynom& fkt) {
 	// creates an array of polynoms in M,C that are
 	// the coefficients of fkt in Z
@@ -1227,6 +1544,109 @@ ZMCpolynom* getMcoeff(ZMCpolynom& fkt) {
 	return erg;
 }
 
+// MatrixLoader
+MatrixLoader::MatrixLoader() {
+	f=NULL;
+	fn[0]=0;
+	dim=0;
+	currentposx=currentposy=0;
+}
+
+MatrixLoader::~MatrixLoader() {
+	if (f) fclose(f);
+}
+
+void MatrixLoader::close(void) {
+	fclose(f);
+}
+	
+void MatrixLoader::prepareForLoading(const char* afn) {
+	strcpy(fn,afn);
+	f=fopen(fn,"rb");
+	if (!f) {
+		LOGMSG2("\nError. Cannot prepare matrix |%s| for loading\n",fn);
+		exit(99);
+	}
+	if (fread(&dim,1,sizeof(dim),f) != sizeof(dim)) {
+		LOGMSG2("\nError/2. Cannot prepare matrix |%s| for loading\n",fn);
+		exit(99);
+	}
+	
+	// now file pointer is at position 0,0
+	currentposx=currentposy=0;
+}
+
+int8_t MatrixLoader::loadAtYX(
+	ZMCpolynom& res,
+	const int32_t ay,
+	const int32_t ax
+) {
+	#define SETTOSTART \
+	{\
+		fseek(f,0,SEEK_SET);\
+		int32_t d;\
+		if (fread(&d,1,sizeof(d),f) != sizeof(d)) {\
+			LOGMSG2("\nError/3. Cannot prepare matrix |%s| for loading\n",fn);\
+			exit(99);\
+		}\
+		currentposx=currentposy=0;\
+	}
+	
+	// is the position to load EARLIER then current?
+	// if so, reset the file
+	if ( 
+		( (ay == currentposy) && (ax < currentposx) ) ||
+		( ay < currentposy )
+	) {
+		SETTOSTART
+	} // to load is earlier
+	
+	// now current points to either the polynomial to load
+	// or an earler one, so the one to load comes "after"
+	int8_t whatid;
+	
+	while (1) {
+		if (fread(&whatid,1,sizeof(whatid),f) != sizeof(whatid) ) {
+			LOGMSG("\nError/4: MatrixLoader.\n");
+			exit(99);
+		}
+		if ( (currentposx == ax) && (currentposy == ay) ) {
+			if (whatid == NULLPOLYNOMID) {
+				res.clearTerms();
+			} else {
+				res.load(f);
+			}
+			currentposx++;
+			if (currentposx >= dim) {
+				currentposy++;
+				currentposx=0;
+				if (currentposy >= dim) {
+					// set back, but polynomial found and read
+					SETTOSTART
+				}
+			}
+
+			return 1;
+		} // load
+		else {
+			if (whatid != NULLPOLYNOMID) {
+				res.jumpOverLoad(f);
+			}
+			currentposx++;
+			if (currentposx >= dim) {
+				currentposx=0;
+				currentposy++;
+				if (currentposy >= dim) {
+					SETTOSTART
+					return 0; // not found
+				}
+			}
+		} // jump
+	} // while
+	
+	return 0;
+}
+
 // MatrixPolynom
 void MatrixPolynom::load(
 	const char* afn,
@@ -1234,9 +1654,11 @@ void MatrixPolynom::load(
 	const int32_t loadx
 ) {
 	/*
+	
 		if loady>=0 & loadx >= 0 => only that element is to
-		be actually loaded, the rest of the matrix is set to
+		be actually loaded, the rest of the materix is set to
 		constant0
+	
 	*/
 	
 	FILE *f=fopen(afn,"rb");
@@ -1302,6 +1724,132 @@ void MatrixPolynom::load(
 	fclose(f);
 }
 
+void MatrixPolynom::loadRowCol(
+	const char* afn,
+	const int32_t row,
+	const int32_t col
+) {
+	/*
+		only loads row "row" and column "col" of the
+		matrix in file afn. all other entres are set to ZERO
+	
+	*/
+	
+	FILE *f=fopen(afn,"rb");
+	if (!f) {
+		LOGMSG2("\nError. Not able to open file for matrix loading |%s|.\n",afn);
+		exit(99);
+	}
+	
+	int32_t d;
+	if (fread(&d,1,sizeof(dim),f) != sizeof(dim)) {
+		LOGMSG("\nError. Reading matrix. Probably invalid file. Deleting recommended.\n");
+		exit(99);
+	}
+	
+	if ( (!tmgr) || (!ptmgr) ) {
+		LOGMSG("\nError. Implementation. MatrixPolynom::load.memory managaer pointer is nil.ßn");
+		exit(99);
+	}
+	
+	// sets mgr to the same value, but this way calling
+	// setDimension one is forced to provide a valid manager
+	if (!entryYX) {
+		setDimension(tmgr,ptmgr,d); // sets dim and allocates memory
+	} else {
+		if (d != dim) {
+			delete[] entryYX;
+			setDimension(tmgr,ptmgr,d);
+		} else {
+			// reConstructor polynomial entries
+			for(int32_t y=0;y<dim;y++) {
+				for(int32_t x=0;x<dim;x++) {
+					// index correct as dim <= 2^14
+					entryYX[y*dim+x].reConstructor(tmgr,ptmgr);
+				}
+			}
+		}
+	}
+	
+	for(int32_t y=0;y<dim;y++) {
+		for(int32_t x=0;x<dim;x++) {
+			int8_t whatid;
+			if (fread(&whatid,1,sizeof(whatid),f) != sizeof(whatid)) {
+				LOGMSG("\nError. Reading matrix polynomial. Probably invalid matrix file. Deleting recommended.\n");
+				exit(99);
+			}
+			if (whatid == NULLPOLYNOMID) {
+				// dim <= 2^14
+				entryYX[y*dim+x].clearTerms(); // null-Polynom
+			} else {
+				if ( (x == col) || (y == row) ) {
+					// load polynomial
+					entryYX[y*dim+x].load(f);
+				} else {
+					entryYX[y*dim+x].jumpOverLoad(f);
+				}
+			}
+		} // x
+	} // y
+	
+	fclose(f);
+}
+
+int8_t loadPolynomialFromMatrix_FTYX(
+	const char* afn,
+	ZMCpolynom& res,
+	const int32_t aty,
+	const int32_t atx
+) {
+	/*
+	
+		loads onlya specific polynomial of a matrix
+		the rest is set to zero
+	
+	*/
+	
+	FILE *f=fopen(afn,"rb");
+	if (!f) {
+		LOGMSG2("\nError. Not able to open file for matrix loading |%s|.\n",afn);
+		exit(99);
+	}
+	
+	int32_t dim;
+	if (fread(&dim,1,sizeof(dim),f) != sizeof(dim)) {
+		LOGMSG("\nError. Reading matrix. Probably invalid file. Deleting recommended.\n");
+		exit(99);
+	}
+	
+	for(int32_t y=0;y<dim;y++) {
+		for(int32_t x=0;x<dim;x++) {
+			int8_t whatid;
+			if (fread(&whatid,1,sizeof(whatid),f) != sizeof(whatid)) {
+				LOGMSG("\nError. Reading matrix polynomial. Probably invalid matrix file. Deleting recommended.\n");
+				exit(99);
+			}
+			if (whatid == NULLPOLYNOMID) {
+				if ( (y == aty) && (x == atx) ) {
+					res.clearTerms();
+					fclose(f);
+					return 1;
+				}
+				// nothing to load or jump over
+			} else {
+				if ( (y == aty) && (x == atx) ) {
+					res.load(f);
+					fclose(f);
+					return 1;
+				}
+				res.jumpOverLoad(f);
+			}
+		} // x
+	} // y
+	
+	fclose(f);
+	
+	return 0;
+}
+
 void MatrixPolynom::save(const char* afn) {
 	FILE *f=fopen(afn,"wb");
 	if (!f) {
@@ -1335,21 +1883,6 @@ void MatrixPolynom::save(const char* afn) {
 	} // y
 	
 	fclose(f);
-}
-
-void swapZMCpolynom(
-	ZMCpolynom& a,
-	ZMCpolynom& b
-) {
-	PZMCterm* tp=a.terms;
-	a.terms=b.terms;
-	b.terms=tp;
-	
-	swapInt(a.anzterms,b.anzterms);
-	swapInt(a.Zdegree,b.Zdegree);
-	swapInt(a.Mdegree,b.Mdegree);
-	swapInt(a.Cdegree,b.Cdegree);
-	swapInt(a.allocatedterms,b.allocatedterms);
 }
 
 int8_t MatrixPolynom::entryPositiveOne_YX(
@@ -1466,7 +1999,7 @@ void MatrixPolynom::setDimension(
 	}
 	
 	setConstant0polynom();
-	
+
 }
 
 void MatrixPolynom::setConstant0polynom(void) {
@@ -1530,6 +2063,23 @@ void setSylvesterMatrix(
 
 }
 
+void polynomMul_TTermB(
+	ZMCpolynom& res,
+	ZMCterm& A,
+	ZMCpolynom& B
+) {
+	res.clearTerms();
+	
+	ZMCterm one;
+	for(int32_t i=0;i<B.anzterms;i++) {
+		termMul_TAB(one,A,*B.terms[i]);
+		// as B is sorted, multiplying by the same term A
+		// doesn't change the ordering
+		res.addTermLast_FZMC(one);
+	}
+
+}
+
 void polynomMul_TAB(
 	ZMCpolynom& res,
 	ZMCpolynom& A,
@@ -1545,6 +2095,7 @@ void polynomMul_TAB(
 		for(int32_t g=0;g<B.anzterms;g++) {
 			// termMul does not invoke a memory managaer
 			termMul_TAB(one,*A.terms[f],*B.terms[g]);
+			if (one.factor.vorz == 0) res.mighthaveremoveablezeroterms=1;
 			
 			// here memory manager of result is used
 			res.addTerm_FZMC(one);
@@ -1553,11 +2104,125 @@ void polynomMul_TAB(
 	
 }
 
+void polynomMul_TAB_split(
+	ZMCpolynom& res,
+	ZMCpolynom& A,
+	ZMCpolynom& B,
+	
+	/* temporary variables */
+	ZMCpolynom& hlp2,
+	ZMCpolynom& hlp3,
+	ZMCpolynom& hlp4
+) {
+	// use the memory manager throughout of the resulting
+	// variable
+	
+	hlp2.clearTerms();
+	hlp3.clearTerms();
+	hlp4.clearTerms();
+	
+	// splitting polynomials A and B in each two paerts
+	// A=A1+A2, B=B1+B2
+	// and calculating A1*B1+A1*B2+A2*B1+B2*B2 in parallel
+	
+	int32_t ah=A.anzterms >> 1;
+	int32_t bh=B.anzterms >> 1;
+	
+	res.clearTerms();
+	// res is used for the first parallel section
+	
+	#pragma omp parallel
+	{
+		#pragma omp sections
+		{
+			#pragma omp section
+			{
+				ZMCterm one1;
+				for(int32_t f=0;f<ah;f++) {
+					for(int32_t g=0;g<bh;g++) {
+						// termMul does not invoke a memory managaer
+						termMul_TAB(one1,*A.terms[f],*B.terms[g]);
+						// here memory manager of result is used
+						res.addTerm_FZMC(one1);
+					} // g
+				} // f
+
+			} // section A1*B1
+			
+			#pragma omp section
+			{
+				ZMCterm one2;
+				for(int32_t f=0;f<ah;f++) {
+					for(int32_t g=bh;g<B.anzterms;g++) {
+						// termMul does not invoke a memory managaer
+						termMul_TAB(one2,*A.terms[f],*B.terms[g]);
+						// here memory manager of result is used
+						hlp2.addTerm_FZMC(one2);
+					} // g
+				} // f
+			} // section A1*B2
+
+			#pragma omp section
+			{
+				ZMCterm one3;
+				for(int32_t f=ah;f<A.anzterms;f++) {
+					for(int32_t g=0;g<bh;g++) {
+						// termMul does not invoke a memory managaer
+						termMul_TAB(one3,*A.terms[f],*B.terms[g]);
+						// here memory manager of result is used
+						hlp3.addTerm_FZMC(one3);
+					} // g
+				} // f
+
+			} // section A2*B1
+
+			#pragma omp section
+			{
+				ZMCterm one4;
+				for(int32_t f=ah;f<A.anzterms;f++) {
+					for(int32_t g=bh;g<B.anzterms;g++) {
+						// termMul does not invoke a memory managaer
+						termMul_TAB(one4,*A.terms[f],*B.terms[g]);
+						// here memory manager of result is used
+						hlp4.addTerm_FZMC(one4);
+					} // g
+				} // f
+			} // section A2*B2
+
+		} // sections
+		
+	} // parallel
+	
+	// res already has part A1*B1 stored
+	#pragma omp parallel
+	{
+		#pragma omp sections 
+		{
+				#pragma omp section
+				{
+					res.addPoly(hlp2);
+				} // section res+hlp2
+				
+				#pragma omp section
+				{
+					hlp3.addPoly(hlp4);
+				} // section hlp3+hlp4
+				
+		} // sections
+	} // parallel
+	
+	// res=res+hlp2 + (hlp3=hlp3+hlp4)
+	res.addPoly(hlp3);
+	// res-mighthaveremoveable is set
+
+}
+
 void termMul_TAB(
 	ZMCterm& res,
 	ZMCterm& A,
 	ZMCterm& B
 ) {
+
 	bigintMul_TAB(res.factor,A.factor,B.factor);
 	
 	if (
@@ -1591,7 +2256,6 @@ void polynomDiv_rf_TRAB(
 	ZMCpolynom& hlpt1,
 	ZMCpolynom& hlpt2,
 	ZMCpolynom& hlpm2
-	
 ) {
 	/* 
 	
@@ -1615,13 +2279,14 @@ void polynomDiv_rf_TRAB(
 		\
 		if (hlpt1.isZero() <= 0) {\
 			LOGMSG("\nError. polynomDiv does not satisfy invariant\n");\
+			LOGMSG("\nA: "); A.ausgabe(stdout); A.ausgabe(flog);\
+			LOGMSG("\nB: "); B.ausgabe(stdout); B.ausgabe(flog);\
 			exit(99);\
 		}\
 	}
 	
 	A.removeZeroTerms();
 	A.checkDegree();
-
 	B.removeZeroTerms();
 	B.checkDegree();
 	
@@ -1652,7 +2317,7 @@ void polynomDiv_rf_TRAB(
 	
 	BigInt idiv,irem;
 	
-	// try variables in a specific order
+	// first try the c variable, the m, then z
 	for(int32_t var=2;var>=0;var--) {
 		if ( (var==0) && ( (B.Cdegree == 0) || (A.Cdegree == 0) ) ) continue;
 		if ( (var==1) && ( (B.Mdegree == 0) || (A.Mdegree == 0) ) ) continue;
@@ -1671,9 +2336,13 @@ void polynomDiv_rf_TRAB(
 			hlprest.clearTerms();
 			hlprest.copyFrom(A);
 			dividing.clearTerms();
-		
+			
+			// degre of hlprest is correct as it is A here
+			// and for A checkdegree has been called
 			while (1) {
 			
+				//printf("\n\nrest "); hlprest.ausgabe(stdout);
+	
 				if (hlprest.isZero() > 0) {
 					remainder.clearTerms();
 					// dividing already set
@@ -1685,9 +2354,11 @@ void polynomDiv_rf_TRAB(
 			
 				int32_t resthi=-1;
 	
-				// degree in hlprest is corrct
+				// degree in hlprest is corrct by call to
+				// checkDegree at end of while
 				for(int32_t i=0;i<hlprest.anzterms;i++) {
-					// all occurin variables must have a degree
+					// to be used,
+					// all occuring variables must have a degree
 					// at least as high as the chosen B-term
 					// otherwise no division can occur
 					if (
@@ -1722,12 +2393,20 @@ void polynomDiv_rf_TRAB(
 						break;
 					}
 				} // i
+				//printf("out");
 			
 				if (resthi < 0) {
 					break; // bidx, try next possible term
 				}
 				
 				// idiv usable
+				
+				ZMCterm tone;
+				tone.factor.copyFrom(idiv);
+				tone.Zexponent=hlprest.terms[resthi]->Zexponent-B.terms[bidx]->Zexponent;
+				tone.Mexponent=hlprest.terms[resthi]->Mexponent-B.terms[bidx]->Mexponent;
+				tone.Cexponent=hlprest.terms[resthi]->Cexponent-B.terms[bidx]->Cexponent;
+				
 				hlpm2.clearTerms();
 				hlpm2.addTerm_FZMC(
 					idiv,
@@ -1735,10 +2414,13 @@ void polynomDiv_rf_TRAB(
 					hlprest.terms[resthi]->Mexponent-B.terms[bidx]->Mexponent,
 					hlprest.terms[resthi]->Cexponent-B.terms[bidx]->Cexponent
 				);
-				polynomMul_TAB(hlpt2,hlpm2,B);
+				polynomMul_TTermB(
+					hlpt2,*hlpm2.terms[0],B
+				);
+
 				hlprest.subPoly(hlpt2);
 				hlprest.removeZeroTerms();
-				hlprest.checkDegree();
+				hlprest.checkDegree(); // now degree is correct
 				dividing.addPoly(hlpm2);
 			
 			} // while
@@ -1784,27 +2466,19 @@ void fractionFreeGaussDet_TA(
 	*/
 	
 	/*
-		hybrid model
+	
+		target matrix is stored directly onto disc
 		
-		matrix Mk: current matrix as in paper
-		loaded from disc
-		as polynomials therein are fixed, only the necessary
-		memoy has been allocated
+		Mk matrix: only one element (ayx) is loaded at use time
+		(only used once), in memory are additionally only the
+		row k and column k
 		
-		matrix Mpreviousk: only diagonal element a(k-1)(k1,k1)
-		is loaded from disc
-		
-		target matrix M(k+1) will be computed element
-		by element and stored directly onto disc as its
-		polynomial will only be used in the next step
-		
-		Upcoming: Reuse of subexpressions already multiplied
-		(especially polynomial a(k)(k,k) times some bigints
+		Mk-1: only element a(k-1)(k-1,k-1) is loaded
 	
 	*/
 	
 	int32_t lastfullstoredk=0; // NOT -1
-	// 0 will not be loaded anyways but constructed from
+	// 0 will not be loaded anyways but copied from
 	// Sylvester's matrix
 	
 	int32_t dimension=sum_int32t(fstrictP.Zdegree,fderm.Zdegree);
@@ -1822,12 +2496,9 @@ void fractionFreeGaussDet_TA(
 	
 	ZMCtermMemoryManager tmgr;
 	PZMCtermMemoryManager ptmgr;
-
-	MatrixPolynom* Mpreviousk=new MatrixPolynom;
-	Mpreviousk->setDimension(
-		&tmgr,
-		&ptmgr,
-		dimension); // constant0 polynom
+	
+	// previous a(k-1)(k-1,k-1) is loaded
+	// directly as a polynom
 
 	MatrixPolynom* Mk=new MatrixPolynom;
 	Mk->setDimension(
@@ -1842,10 +2513,35 @@ void fractionFreeGaussDet_TA(
 	const int8_t REERG=1;
 	int8_t resultantwouldbe=RE0;
 	
-	ZMCpolynom rem(&tmgr,&ptmgr,-1),
-		t1(&tmgr,&ptmgr,-1),
+	MatrixLoader mloader;
+	mloader.f=NULL;
+	
+	// polynomials which are handled in parallel must each
+	// have their own memory manager to avoid colliding
+	// requests. The number of objects per memory manager
+	// internal page is reduced to not allocate CHUNKSIZE
+	// as only one p0olynomial is handled by each manager
+	// less than CHUNKSIZE should suffice
+	ZMCtermMemoryManager tsplitm[6](CHUNKSIZE >> 2),
+		tm1(CHUNKSIZE >> 2),tm2(CHUNKSIZE >> 2);
+	PZMCtermMemoryManager ptsplitm[6](CHUNKSIZE >> 2),
+		ptm1(CHUNKSIZE >> 2),
+		ptm2(CHUNKSIZE >> 2);
+	ZMCpolynom t1(&tmgr,&ptmgr,-1),
 		t2(&tmgr,&ptmgr,-1),
+		splithlp[6];
+	for(int32_t spliti=0;spliti<6;spliti++) {
+		splithlp[spliti].setMemoryManager(
+			&tsplitm[spliti],
+			&ptsplitm[spliti]
+		);
+	}
+
+	// those use one huge memory manager
+	ZMCpolynom rem(&tmgr,&ptmgr,-1),
 		erg(&tmgr,&ptmgr,-1),
+		ak1_k1k1(&tmgr,&ptmgr,-1),
+		ak_yx(&tmgr,&ptmgr,-1),
 		
 		/* helper variables to pass to polynomDiv, Mul to */
 		/* be used as temporary variables whose allocated memory */
@@ -1854,12 +2550,12 @@ void fractionFreeGaussDet_TA(
 		hlp2(&tmgr,&ptmgr,-1),
 		hlp3(&tmgr,&ptmgr,-1),
 		hlp4(&tmgr,&ptmgr,-1);
-	
+		
 	if (lastfullstoredk == (dimension-1) ) {
 		// done
 		getMatrixFileName(tmp,lastfullstoredk);
 		printf("\n  nothing to compute. Reading results.");
-		Mk->load(tmp,dimension-1,dimension-1); // just diagonal
+		Mk->load(tmp,dimension-1,dimension-1); 
 		// resultant is lower right entry
 		// dim <= 2^14
 		fres.copyFrom(Mk->entryYX[(dimension-1)*dimension+(dimension-1)]);
@@ -1868,16 +2564,24 @@ void fractionFreeGaussDet_TA(
 
 	printf("\ncomputing steps k=[%i..%i]",1+lastfullstoredk,dimension-1);
 	
+	int32_t ystart=0;
+	
 	for(int32_t k=lastfullstoredk;k<(dimension-1);k++) {
-
-		// freeing memory from last round
 		tmgr.freePhysically();
 		ptmgr.freePhysically();
-		
+		tm1.freePhysically();
+		tm2.freePhysically();
+		ptm1.freePhysically();
+		ptm2.freePhysically();
+		for(int32_t spliti=0;spliti<6;spliti++) {
+			tsplitm[spliti].freePhysically();
+			ptsplitm[spliti].freePhysically();
+		}
 		// re-initialize as if just constructed
 		
 		Mk->setDimension(&tmgr,&ptmgr,dimension);
-		Mpreviousk->setDimension(&tmgr,&ptmgr,dimension);
+		ak1_k1k1.reConstructor(&tmgr,&ptmgr);
+		ak_yx.reConstructor(&tmgr,&ptmgr);
 		
 		char filenamenextk[2048];
 		getMatrixFileName(filenamenextk,k+1);
@@ -1895,6 +2599,9 @@ void fractionFreeGaussDet_TA(
 		
 		printf("\n  step %i/%i ... ",k+1,dimension-1);
 
+		char filematrixk[1024];
+		filematrixk[0]=0;
+		
 		if (k == 0) {
 			// if only k=0 is stored, it is as if starting anew
 
@@ -1902,7 +2609,7 @@ void fractionFreeGaussDet_TA(
 			// the current matrix
 			printf("initial step with Sylvester matrix ... ");
 
-			printf("\n  creating Sylvester matrix ... ");
+			printf("\ncreating Sylvester matrix ... ");
 			printf("\n  getting z-coefficients ... ");
 			ZMCpolynom *fZcoeff=getZcoeff(fstrictP);
 			ZMCpolynom *derZcoeff=getZcoeff(fderm);
@@ -1914,27 +2621,48 @@ void fractionFreeGaussDet_TA(
 				fZcoeff,derZcoeff
 			);
 			
-			getMatrixFileName(tmp,0);
-			Mk->save(tmp);
+			getMatrixFileName(filematrixk,0);
+			Mk->save(filematrixk);
 			// allocated using global term managaer, not here the local one
 		} else {
 			// load file[k] at Mk and file[k-1] at Mpreviousk
 			printf("loading %i,%i ... ",
 				k-1,k);
-			getMatrixFileName(tmp,k);
+			getMatrixFileName(filematrixk,k);
 			
-			Mk->load( tmp , -1,-1 ); // full matrix to load
+			Mk->loadRowCol(filematrixk,k,k);
 
 			getMatrixFileName(tmp,k-1);
-			Mpreviousk->load( tmp , k-1,k-1 ); // only diagonal element
-			
-			// if files not present => already terminated
+			if (loadPolynomialFromMatrix_FTYX(
+				tmp,ak1_k1k1,k-1,k-1
+			) <= 0) {
+				LOGMSG2("\nError. Cannot read previous polynomial a(k-1)(k-1,k-1) |%s|\n",tmp);
+				exit(99);
+			}
+		}
+		
+		if (filematrixk[0] <= 0) {
+			LOGMSG("\nError. Implementation. Matrix at k not loadable\n");
+			exit(99);
 		}
 		
 		printf("computing ...");
 		
-		t1.reConstructor(&tmgr,&ptmgr);
-		t2.reConstructor(&tmgr,&ptmgr);
+		mloader.close();
+		// stored in Mk are only row k and column k
+		// all others are only needed once in the akk*ayx
+		// term, so they will only be read in once
+		mloader.prepareForLoading(filematrixk);
+		
+		t1.reConstructor(&tm1,&ptm1);
+		t2.reConstructor(&tm2,&ptm2);
+		for(int32_t spliti=0;spliti<6;spliti++) {
+			splithlp[spliti].reConstructor(
+				&tsplitm[spliti],
+				&ptsplitm[spliti]
+			);
+		}
+		
 		erg.reConstructor(&tmgr,&ptmgr);
 		rem.reConstructor(&tmgr,&ptmgr);
 		hlp1.reConstructor(&tmgr,&ptmgr);
@@ -1942,9 +2670,22 @@ void fractionFreeGaussDet_TA(
 		hlp3.reConstructor(&tmgr,&ptmgr);
 		hlp4.reConstructor(&tmgr,&ptmgr);
 		
-		for(int32_t y=0;y<dimension;y++) {
-			if ( (y & 0b111) == 0) {
-				printf(" %i",dimension-y);
+		// entry valid as indices and dimension <= 2^14
+		#define ENTRYPTRKYX(KK,YY,XX) &KK->entryYX[(YY)*dimension+(XX)]
+
+		ZMCpolynom* ak_kk=ENTRYPTRKYX(Mk,k,k);
+		int8_t akkkiszero=ak_kk->isZero();
+		
+		for(int32_t y=ystart;y<dimension;y++) {
+			ZMCpolynom* ak_yk=ENTRYPTRKYX(Mk,y,k);
+			int8_t akykiszero=ak_yk->isZero();
+
+			if (dimension > 100) printf("%i ",dimension-y);
+			else if ( (y & 0b111) == 0) {
+				int32_t a=tmgr.anzptr+ptmgr.anzptr;
+				if (a > 5) {
+					printf(".#%i",tmgr.anzptr);
+				} else printf(".");
 			}
 			
 			for(int32_t x=0;x<dimension;x++) {
@@ -1960,6 +2701,8 @@ void fractionFreeGaussDet_TA(
 					}
 					continue;
 				}
+				
+				//if (dimension > 100) if ( (x & 0b111) == 0) printf("[%i] ",dimension-x);
 			
 				// works also if it is finally a polynomial
 				// with zero terms or the constant-0 1-term polynomial
@@ -1971,54 +2714,82 @@ void fractionFreeGaussDet_TA(
 				
 				*/
 				
-				// entry valid as indices and dimension <= 2^14
-				#define ENTRYPTRKYX(KK,YY,XX) &KK->entryYX[(YY)*dimension+(XX)]
-				
-				ZMCpolynom* ak_kk=ENTRYPTRKYX(Mk,k,k);
-				ZMCpolynom* ak_yx=ENTRYPTRKYX(Mk,y,x);
-				ZMCpolynom* ak_yk=ENTRYPTRKYX(Mk,y,k);
 				ZMCpolynom* ak_kx=ENTRYPTRKYX(Mk,k,x);
-				ZMCpolynom* ak1_k1k1=NULL;
 				
-				if (k > 0) {
-					ak1_k1k1=ENTRYPTRKYX(Mpreviousk,k-1,k-1);
-					if (ak1_k1k1->isZero()) {
-						LOGMSG("\nError. fractionFree division by zero\n");
-						LOGMSG2("element k-1,k-1=%i\n",k-1);
-						LOGMSG("\nProbably a principal minor has determinant 0 .\n");
-						LOGMSG("Fraction-free Gauss elimination cannot be applied here.\n");
-						LOGMSG("Manually exchanging rows and/or columns is recommended (but not implemented so far).");
-						exit(99);
-					}
+				if (mloader.loadAtYX(ak_yx,y,x) <= 0) {
+					LOGMSG2("\nError. Cannot load polynomial a(k)(y,x) |%s|\n",
+						filematrixk);
+					exit(99);
 				}
+
+				// if it is a polynomial with 0 terms
+				// this can be saved in twow qays: as nullpolynom-flag
+				// or as notnullpolynom wth the empty polynomial
 				
 				t1.clearTerms();
-				
-				if (
-					(ak_kk->isZero() <= 0) &&
-					(ak_yx->isZero() <= 0)
-				) {
-					polynomMul_TAB(t1,*ak_kk,*ak_yx);
-				}
-				
 				t2.clearTerms();
+				
+				// multiplying akkk*akyx and ayk*akx
+				// simultaneously
+				
 				if (
-					(ak_yk->isZero() <= 0) &&
+					(akkkiszero <= 0) &&
+					(akykiszero <= 0) &&
+					(ak_yx.isZero() <= 0) &&
 					(ak_kx->isZero() <= 0)
 				) {
-					polynomMul_TAB(t2,*ak_yk,*ak_kx);
+					// 11,t2 have different memroy managaers, so
+					// work collision-free
+					#pragma omp parallel
+					{
+						#pragma omp sections
+						{
+							#pragma omp section
+							{
+								polynomMul_TAB_split(t1,*ak_kk,ak_yx,splithlp[0],splithlp[1],splithlp[2]);
+							} // section
+							
+							#pragma omp section
+							{
+								polynomMul_TAB_split(t2,*ak_yk,*ak_kx,splithlp[3],splithlp[4],splithlp[5]);
+							} // section
+							
+						} // sections
+					} // parallel
+					
 					t1.subPoly(t2);
+				} else {
+					// this only happens at the first stages
+					// of matrix reduction, lator on all
+					// entries are pretty large polynomials
+
+					if (
+						(akkkiszero <= 0) &&
+						(ak_yx.isZero() <= 0)
+					) {
+						polynomMul_TAB(t1,*ak_kk,ak_yx);
+					}
+					if (
+						(akykiszero <= 0) &&
+						(ak_kx->isZero() <= 0)
+					) {
+						polynomMul_TAB(t2,*ak_yk,*ak_kx);
+						t1.subPoly(t2);
+					}
 				}
 
 				t1.removeZeroTerms();
+
+				// polynomials in splithlp are now free
+				// to use again in division
 				
 				if (k > 0) { 
 					// ak1_k1k1 is valid pointer
-					if (ak1_k1k1->isPositiveOne() <= 0) {
+					if (ak1_k1k1.isPositiveOne() <= 0) {
 						polynomDiv_rf_TRAB(
 							erg,rem,
 							t1,
-							*ak1_k1k1,
+							ak1_k1k1,
 							hlp1,hlp2,hlp3,hlp4
 						);
 						
@@ -2037,6 +2808,7 @@ void fractionFreeGaussDet_TA(
 						}
 						erg.save(fnextk);
 						resultantwouldbe=REERG;
+
 					} else {
 						// denominator is 1, so no division necessary
 						// write t1
@@ -2046,13 +2818,14 @@ void fractionFreeGaussDet_TA(
 						}
 						t1.save(fnextk);
 						resultantwouldbe=RET1;
+
 					}
 				} else {
 					// write t1
 					if (fwrite(&notnullpolynom,1,sizeof(nullpolynom),fnextk) != sizeof(nullpolynom)) {
-						LOGMSG("\nError. Writing current matrix/3. Probably invalid file. Deleting recommended.\n");
+						LOGMSG("\nError. Save. Matrix not valid/4.\n");
 						exit(99);
-					}
+					};
 					t1.save(fnextk);
 					resultantwouldbe=RET1;
 				}
@@ -2069,7 +2842,7 @@ void fractionFreeGaussDet_TA(
 	
 	// resultant now has been stored on file
 	
-	// physical copy - as by returning the lokal memory
+	// physical copy as by returning the lokal memory
 	// manager will be destroyed and so its allocated
 	// memory
 	if (resultantwouldbe == RET1) {
@@ -2106,7 +2879,6 @@ void polynomComposition_at_Z_TNA(
 		neu.clearTerms();
 		
 		for(int i=0;i<current.anzterms;i++) {
-			//printf("term[%i] ",i); current.terms[i].ausgabe(stdout);
 			if (current.terms[i]->factor.vorz == 0) continue;
 			
 			if (current.terms[i]->Zexponent <= 0) {
@@ -2180,13 +2952,13 @@ void polynomDer_at_Z_TA(
 		term.Cexponent=f.terms[i]->Cexponent;
 		term.Mexponent=f.terms[i]->Mexponent;
 		term.Zexponent=f.terms[i]->Zexponent - 1;
-		int32_t ze=(uint32_t)f.terms[i]->Zexponent;
+		int32_t ze=(int32_t)f.terms[i]->Zexponent;
 		bigintMul_digit_TDA(
 			term.factor,
 			ze,
 			f.terms[i]->factor
 		);
-
+		
 		fderm.addTerm_FZMC(term);
 	} // i
 }
@@ -2198,15 +2970,16 @@ char* getFilenameCoeff(char* erg,const int32_t coeff) {
 		
 	return erg;
 }
+
 			
 // main
 
 int32_t main(int32_t argc,char** argv) {
 	int32_t t0=clock();
 	big1.set_int64(1);
-	
-	flog=fopen("mset-component-eq.log","at");
-	fprintf(flog,"\n----------\nstart mset-component-eq\n\n");
+
+	flog=fopen("resultant.log","at");
+	fprintf(flog,"\n----------\nstart resultant\n\n");
 	
 	for(int32_t i=1;i<argc;i++) {
 		upper(argv[i]);
@@ -2231,7 +3004,7 @@ int32_t main(int32_t argc,char** argv) {
 	);
 
 	#ifdef _INVOKECLAIMVERIFICATIONS
-	LOGMSG("\nINFO: Checks mul/div bigInt, polynomials invoked");
+	LOGMSG("\nINFO: Gegenproben mul/div bigInt, polynomials invoked");
 	#endif
 	
 	LOGMSG3("\ncomponent period %i for multibrot degree %i\n",
@@ -2245,12 +3018,13 @@ int32_t main(int32_t argc,char** argv) {
 
 	basefkt.setMemoryManager(&globalzmctermmgr,&globalpzmctermmgr);
 	basefkt.clearTerms();
+	
+	// unicritical multibrot z^d+c
 	basefkt.addTerm_FZMC(1,MULTIBROT,0,0); // z^MULTIBROT
 	basefkt.addTerm_FZMC(1,0,0,1); // c
-
-	// basefkt has been set correctly
+	
 	setPeriod(currentperiod);
-
+	
 	if (
 		(fstrictP.Zdegree >= MAXDEGREE) ||
 		(fstrictP.Mdegree >= MAXDEGREE) ||
@@ -2276,11 +3050,11 @@ int32_t main(int32_t argc,char** argv) {
 	// ///////////////////////////////
 	//
 	// main function call
-	
+	//
 
 	fractionFreeGaussDet_TA(fres);
 	
-	
+	//
 	//
 	//////////////////////////////////
 	
@@ -2312,6 +3086,7 @@ int32_t main(int32_t argc,char** argv) {
 			resMcoeff[d].terms[t]->factor.ausgabe(f);
 			fprintf(f,"*c^%i\n",resMcoeff[d].terms[t]->Cexponent);
 		}
+		
 		fprintf(f,".\n");
 		fclose(f);
 	}
@@ -2369,10 +3144,11 @@ int32_t main(int32_t argc,char** argv) {
 	
 	LOGMSG("\n|- all coefficients are stored on file");
 	LOGMSG("\n----------------------------------------------------\n\n");
+
 	int32_t t1=clock();
 	int32_t dt=t1-t0;
 	double duration=(double)(dt) / CLOCKS_PER_SEC;
-	LOGMSG2("duration %.0lf sec\n",duration);
+	LOGMSG2("\nduration %.0lf sec\n",duration);
 
 	if (flog) {
 		fclose(flog);
@@ -2381,4 +3157,3 @@ int32_t main(int32_t argc,char** argv) {
 	
 	return 0;
 }
-
